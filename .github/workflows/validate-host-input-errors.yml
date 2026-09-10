@@ -1,0 +1,77 @@
+name: Validate host input errors
+on:
+  push:
+    branches: [validation/host-input-errors]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Prepare clean candidate
+        run: |
+          cp tests/test_host_input_validation.py "$RUNNER_TEMP/test_host_input_validation.py"
+          git switch -c fix/host-input-validation 516fa8f379494a75aed2847763b6e2ac6a546f96
+          cp "$RUNNER_TEMP/test_host_input_validation.py" tests/test_host_input_validation.py
+          python -m pip install -e '.[test]' black isort
+          docker pull mongo:8.0
+      - name: Reproduce malformed-input failures
+        run: |
+          set +e
+          python -m pytest -o addopts='' -q --mongo-image-tag mongo:8.0 tests/test_host_input_validation.py --junitxml="$RUNNER_TEMP/baseline.xml" > "$RUNNER_TEMP/before.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/before.log"
+          test "$result" -eq 1
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root = ET.parse(Path(os.environ['RUNNER_TEMP']) / 'baseline.xml')
+          failed = [t.attrib['name'] for t in root.iter('testcase') if t.find('failure') is not None]
+          assert 'test_missing_ip_in_constructor_is_a_field_error' in failed, failed
+          print('Confirmed baseline failures:', failed)
+          PY
+      - name: Guard raw model input
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/cyhy_db/models/host_doc.py')
+          source = p.read_text()
+          old = '        # ip may still be string if it was just set\n'
+          new = ('        # Let field validation report missing IPs and invalid model input.\n'
+                 '        if not isinstance(values, dict) or "ip" not in values:\n'
+                 '            return values\n\n' + old)
+          assert source.count(old) == 1
+          p.write_text(source.replace(old, new, 1))
+          PY
+          python -m isort src/cyhy_db/models/host_doc.py tests/test_host_input_validation.py
+          python -m black --line-length 80 src/cyhy_db/models/host_doc.py tests/test_host_input_validation.py
+      - name: Run regression and complete suites
+        run: |
+          python -m pytest -o addopts='' -q --mongo-image-tag mongo:8.0 tests/test_host_input_validation.py
+          python -m pytest -o addopts='' -q --mongo-image-tag mongo:8.0
+          python -m black --check --line-length 80 src/cyhy_db/models/host_doc.py tests/test_host_input_validation.py
+          python -m isort --check-only src/cyhy_db/models/host_doc.py tests/test_host_input_validation.py
+          python -m py_compile src/cyhy_db/models/host_doc.py tests/test_host_input_validation.py
+          git diff --check
+      - name: Publish clean tested branch
+        if: matrix.python == '3.12'
+        run: |
+          git add src/cyhy_db/models/host_doc.py tests/test_host_input_validation.py
+          git config user.name 'Sylvester Kaczmarek'
+          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+          git commit -s -m 'Report malformed host input as validation errors'
+          git push origin HEAD:refs/heads/fix/host-input-validation
+          git log -1 --format='%H %s'
